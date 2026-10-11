@@ -97,6 +97,16 @@
             android:exported="false"
         />
 
+        <!-- Direct notification-tap destination; no broadcast-to-activity trampoline. -->
+        <activity
+            android:name=".liveupdate.MirrorTapActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+        />
+
         <meta-data android:name="flutterEmbedding" android:value="2" />
     </application>
 

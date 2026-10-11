@@ -137,6 +137,17 @@ object LiveUpdateNotifier {
     private var channelsCheckedAt = 0L
 
     private val stateLock = Any()
+    // Stable mirror state per conversation; retain source identity for precise cleanup.
+    private data class ConversationEntry(
+        val sbn: StatusBarNotification,
+        val messageCount: Int,
+        val latestText: String
+    )
+    private data class ConversationState(
+        val sources: MutableMap<String, ConversationEntry> = mutableMapOf()
+    )
+    private val sbnToConversationKey = mutableMapOf<String, String>()
+    private val conversationStates = mutableMapOf<String, ConversationState>()
     private val sbnToAggregateKey = mutableMapOf<String, String>()
     private val aggregateStates = mutableMapOf<String, AggregateState>()
     private val sbnToOtpAggregateKey = mutableMapOf<String, String>()
@@ -247,6 +258,8 @@ object LiveUpdateNotifier {
     fun clearRuntimeState() {
         LiveUpdateNotificationListenerService.invalidateSnapshotCache()
         synchronized(stateLock) {
+            sbnToConversationKey.clear()
+            conversationStates.clear()
             sbnToAggregateKey.clear()
             aggregateStates.clear()
             sbnToOtpAggregateKey.clear()
@@ -316,6 +329,7 @@ object LiveUpdateNotifier {
                 userDismissedMirrorKeys.removeAll(revivedKeys)
                 sbnToAggregateKey[sbn.key]?.let(userDismissedMirrorKeys::remove)
                 sbnToOtpAggregateKey[sbn.key]?.let(userDismissedMirrorKeys::remove)
+                sbnToConversationKey[sbn.key]?.let(userDismissedMirrorKeys::remove)
             }
         }
         if (prefs.getSyncDndEnabled() && isDoNotDisturbActive(context)) {
@@ -423,6 +437,9 @@ object LiveUpdateNotifier {
                 return notMirroredResult()
             }
             if (bypassesRules) {
+                conversationKeyFor(sbn)?.let { conversationKey ->
+                    return mirrorConversation(context, manager, sbn, appPresentationOverride, conversationKey)
+                }
                 val staleAggregateIds = synchronized(stateLock) {
                     clearAggregateTrackingForSbnKeyLocked(sbn.key)
                 }
@@ -936,6 +953,129 @@ object LiveUpdateNotifier {
         }
     }
 
+    /** Group only notifications already allowed by BYPASS settings. */
+    private fun conversationKeyFor(sbn: StatusBarNotification): String? {
+        val notification = sbn.notification
+        val extras = notification.extras
+        val isMessage = (notification.category == Notification.CATEGORY_MESSAGE ||
+            extras.containsKey(Notification.EXTRA_MESSAGES)) &&
+            (notification.flags and Notification.FLAG_GROUP_SUMMARY == 0)
+        val shortcutId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            notification.shortcutId
+        } else null
+        return ConversationGroupingPolicy.conversationKey(
+            packageName = sbn.packageName,
+            isMessage = isMessage,
+            shortcutId = shortcutId,
+            conversationTitle = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString(),
+            notificationTitle = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString(),
+            sourceNotificationKey = sbn.key
+        )
+    }
+
+    private fun conversationMessageCount(notification: Notification): Int {
+        val bundles = notification.extras.getParcelableArray(Notification.EXTRA_MESSAGES)
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Notification.MessagingStyle.Message.getMessagesFromBundleArray(bundles)
+                .count { !it.text.isNullOrBlank() }.coerceAtLeast(1)
+        } else 1
+    }
+
+    private fun conversationLatestText(notification: Notification): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Notification.MessagingStyle.Message.getMessagesFromBundleArray(
+                notification.extras.getParcelableArray(Notification.EXTRA_MESSAGES)
+            ).lastOrNull { !it.text.isNullOrBlank() }?.text?.toString()?.let { return it }
+        }
+        return notification.extras.getCharSequence(Notification.EXTRA_TEXT)?.toString().orEmpty()
+    }
+
+    private fun mirrorConversation(
+        context: Context,
+        manager: NotificationManagerCompat,
+        sbn: StatusBarNotification,
+        appPresentationOverride: AppPresentationOverride,
+        conversationKey: String
+    ): MirrorResult {
+        val route = synchronized(stateLock) {
+            val staleIds = mutableListOf<Int>()
+            val oldKey = sbnToConversationKey[sbn.key]
+            if (oldKey != null && oldKey != conversationKey) {
+                staleIds.addAll(clearConversationTrackingForSbnKeyLocked(sbn.key))
+            }
+            staleIds.addAll(clearSmartTrackingForSbnKeyLocked(sbn.key))
+            staleIds.addAll(clearOtpTrackingForSbnKeyLocked(sbn.key))
+            val state = conversationStates.getOrPut(conversationKey) { ConversationState() }
+            val previous = state.sources[sbn.key]
+            val newMember = previous == null
+            val latestText = conversationLatestText(sbn.notification)
+            val observedCount = ConversationGroupingPolicy.nextMessageCount(
+                previousCount = previous?.messageCount,
+                previousText = previous?.latestText,
+                latestText = latestText,
+                reportedCount = conversationMessageCount(sbn.notification)
+            )
+            state.sources[sbn.key] = ConversationEntry(sbn, observedCount, latestText)
+            sbnToConversationKey[sbn.key] = conversationKey
+            if (newMember) userDismissedMirrorKeys.remove(conversationKey)
+            val latest = state.sources.values.maxWithOrNull(
+                compareBy<ConversationEntry> { it.sbn.postTime }.thenBy { it.sbn.key }
+            ) ?: state.sources.getValue(sbn.key)
+            // This estimates messages from source history plus observed updates.
+            val count = state.sources.values.sumOf { it.messageCount }
+            val title = latest.sbn.notification.extras
+                .getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()
+                ?: latest.sbn.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+                ?: sbn.packageName
+            ConversationRoute(staleIds, latest.sbn, title,
+                ConversationGroupingPolicy.summary(
+                    count, latest.latestText, NativeAppStrings.language(context)),
+                isUserDismissedMirrorLocked(conversationKey))
+        }
+        route.staleIds.forEach { cancelMirroredNotification(manager, it) }
+        // Remove any old standalone mirror for this source.
+        cancelMirroredNotification(manager, mirrorIdForKey(sbn.key))
+        if (route.dismissed) return notMirroredResult()
+        val mirror = buildMirroredNotification(
+            context = context,
+            sbn = route.sbn,
+            appPresentationOverride = appPresentationOverride,
+            mirrorChannel = MirrorNotificationChannel.BYPASS,
+            progressOverride = null,
+            otpOverride = null,
+            smartShortTextOverride = null,
+            requestPromoted = true,
+            allowNavigationIconHeuristics = false,
+            titleOverride = route.title,
+            textOverride = route.text
+        )
+        notifyWithPromotionFallback(
+            context = context,
+            manager = manager,
+            notificationId = mirrorIdForKey(conversationKey),
+            mirrorKey = conversationKey,
+            promotedNotification = mirror,
+            sbn = route.sbn,
+            appPresentationOverride = appPresentationOverride,
+            mirrorChannel = MirrorNotificationChannel.BYPASS,
+            progressOverride = null,
+            otpOverride = null,
+            smartShortTextOverride = null,
+            allowNavigationIconHeuristics = false,
+            titleOverride = route.title,
+            textOverride = route.text
+        )
+        return mirroredResult()
+    }
+
+    private data class ConversationRoute(
+        val staleIds: List<Int>,
+        val sbn: StatusBarNotification,
+        val title: String,
+        val text: String,
+        val dismissed: Boolean
+    )
+
     private fun sourceTextForFiltering(notification: Notification): String {
         val extras = notification.extras
         return buildList {
@@ -1329,6 +1469,9 @@ object LiveUpdateNotifier {
             sbnToOtpAggregateKey.forEach { (sourceKey, aggregateKey) ->
                 if (aggregateKey in publishedKeys) add(sourceKey)
             }
+            sbnToConversationKey.forEach { (sourceKey, aggregateKey) ->
+                if (aggregateKey in publishedKeys) add(sourceKey)
+            }
         }
     }
 
@@ -1388,7 +1531,8 @@ object LiveUpdateNotifier {
             val mirrorKey = mirrorKeysByNotificationId.remove(sbn.id) ?: return
             userDismissedMirrorKeys.add(mirrorKey)
             val sourceKeys = aggregateStates[mirrorKey]?.activeSbnKeys
-                ?: otpAggregateStates[mirrorKey]?.activeSbnKeys ?: setOf(mirrorKey)
+                ?: otpAggregateStates[mirrorKey]?.activeSbnKeys
+                ?: conversationStates[mirrorKey]?.sources?.keys ?: setOf(mirrorKey)
             sourceKeys.forEach { sourceContentRevisions.dismissed(it, setOf(mirrorKey)) }
             callMirrorStates.remove(mirrorKey)
             smartAnimationGenerations.remove(mirrorKey)
@@ -1402,16 +1546,25 @@ object LiveUpdateNotifier {
         val notificationIds = synchronized(stateLock) {
             val aggregateKeys = listOfNotNull(
                 sbnToAggregateKey[sourceKey],
-                sbnToOtpAggregateKey[sourceKey]
+                sbnToOtpAggregateKey[sourceKey],
+                sbnToConversationKey[sourceKey]
             ).toSet()
             val ids = buildSet {
                 add(mirrorIdForKey(sourceKey))
                 aggregateKeys.forEach { add(mirrorIdForKey(it)) }
-                addAll(clearAggregateTrackingForSbnKeyLocked(sourceKey))
+                // Retain conversation entries: stale replay must not resurrect a tap-dismissed mirror.
+                addAll(clearSmartTrackingForSbnKeyLocked(sourceKey))
+                addAll(clearOtpTrackingForSbnKeyLocked(sourceKey))
             }
             userDismissedMirrorKeys.add(sourceKey)
             userDismissedMirrorKeys.addAll(aggregateKeys)
             sourceContentRevisions.dismissed(sourceKey, aggregateKeys + sourceKey)
+            sbnToConversationKey[sourceKey]?.let { chatKey ->
+                conversationStates[chatKey]?.sources?.keys?.forEach { memberKey ->
+                    userDismissedMirrorKeys.add(memberKey)
+                    sourceContentRevisions.dismissed(memberKey, setOf(chatKey, memberKey))
+                }
+            }
             for (key in aggregateKeys + sourceKey) {
                 smartAnimationGenerations.remove(key)
                 smartAnimationStates.remove(key)
@@ -1932,21 +2085,18 @@ object LiveUpdateNotifier {
             builder.addAction(buildCopyOtpAction(context, sbn, otpOverride.code))
         }
 
-        source.contentIntent?.let { sourceContentIntent ->
-            val proxyIntent = Intent(context, MirrorContentIntentReceiver::class.java)
-                .putExtra(MirrorContentIntentReceiver.EXTRA_SOURCE_KEY, sbn.key)
-                .putExtra(
-                    MirrorContentIntentReceiver.EXTRA_SOURCE_CONTENT_INTENT,
-                    sourceContentIntent
-                )
-            val proxyPendingIntent = PendingIntent.getBroadcast(
-                context,
-                mirrorIdForKey(sbn.key),
-                proxyIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.setContentIntent(proxyPendingIntent)
-        }
+        // Tap goes to an Activity directly; avoids Android 12+ notification trampolines.
+        val tapIntent = Intent(context, MirrorTapActivity::class.java)
+            .putExtra(MirrorTapActivity.EXTRA_SOURCE_KEY, sbn.key)
+            .putExtra(MirrorTapActivity.EXTRA_SOURCE_PACKAGE, sbn.packageName)
+            .putExtra(MirrorTapActivity.EXTRA_SOURCE_CONTENT_INTENT, source.contentIntent)
+        val tapPendingIntent = PendingIntent.getActivity(
+            context,
+            mirrorIdForKey(sbn.key),
+            tapIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        builder.setContentIntent(tapPendingIntent)
         copySourceActions(
             context = context,
             source = source,
@@ -4800,7 +4950,19 @@ object LiveUpdateNotifier {
         val idsToCancel = mutableListOf<Int>()
         idsToCancel.addAll(clearSmartTrackingForSbnKeyLocked(sbnKey))
         idsToCancel.addAll(clearOtpTrackingForSbnKeyLocked(sbnKey))
+        idsToCancel.addAll(clearConversationTrackingForSbnKeyLocked(sbnKey))
         return idsToCancel
+    }
+
+    private fun clearConversationTrackingForSbnKeyLocked(sbnKey: String): List<Int> {
+        val conversationKey = sbnToConversationKey.remove(sbnKey) ?: return emptyList()
+        val state = conversationStates[conversationKey] ?: return emptyList()
+        state.sources.remove(sbnKey)
+        if (state.sources.isNotEmpty()) return emptyList()
+        conversationStates.remove(conversationKey)
+        userDismissedMirrorKeys.remove(conversationKey)
+        mirrorKeysByNotificationId.remove(mirrorIdForKey(conversationKey))
+        return listOf(mirrorIdForKey(conversationKey))
     }
 
     private fun clearSmartTrackingForSbnKeyLocked(sbnKey: String): List<Int> {
